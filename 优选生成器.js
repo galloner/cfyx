@@ -245,6 +245,43 @@ function readUrlParams() {
 }
 
 // ===========================================================================
+// Service Worker：拦截带订阅参数的请求，返回纯 text/plain base64（无 HTML）
+// 同一个 JS 文件被 navigator.serviceWorker.register() 加载为 SW 脚本
+// ===========================================================================
+
+if (typeof self !== 'undefined' && typeof window === 'undefined') {
+  // SW 环境：self 存在但 window 不存在
+  self.addEventListener('install', function (e) { self.skipWaiting(); });
+  self.addEventListener('activate', function (e) { e.waitUntil(self.clients.claim()); });
+
+  self.addEventListener('fetch', function (e) {
+    var url = new URL(e.request.url);
+    var sp = url.searchParams;
+    var u = sp.get('u'), i = sp.get('i'), t = sp.get('t');
+
+    // 拦截带完整订阅参数的请求 → 返回纯 base64 文本
+    if (u && i && t) {
+      try {
+        var link = rebuildVlessFromParams({
+          u: u, s: sp.get('s'), h: sp.get('h'), p: sp.get('p'),
+          f: sp.get('f'), n: sp.get('n'), sec: sp.get('sec'), ty: sp.get('ty')
+        });
+        var r = generate(link, splitList(i), splitList(t));
+        e.respondWith(new Response(r.base64, {
+          headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+        }));
+      } catch (err) {
+        e.respondWith(new Response('Error: ' + err.message, {
+          status: 500,
+          headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+        }));
+      }
+    }
+    // 不带参数的请求不拦截，正常返回 index.html
+  });
+}
+
+// ===========================================================================
 // Node.js：导出模块 + CLI
 // ===========================================================================
 
@@ -343,18 +380,44 @@ if (typeof window !== 'undefined') {
   (function () {
     'use strict';
 
-    // ── 订阅模式 ──
-    // index.html 的 body 是空的，这里直接 document.write 纯 base64 文本，
-    // 页面内容就是这些文本本身，不会出现任何 UI / HTML 标签。
     var params = readUrlParams();
+
+    // ── 订阅模式 ──
+    // 注册 SW；SW 激活后拦截请求返回纯 text/plain base64（无任何 HTML 标签）
     if (params && params.uuid && params.addresses && params.ports) {
       try {
         var r = generate(params.link, splitList(params.addresses), splitList(params.ports));
-        document.write(r.base64);
       } catch (e) {
         document.write('Error: ' + e.message);
+        return;
       }
-      return; // 订阅模式结束，不再构建 UI
+
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('优选生成器.js').then(function (reg) {
+          if (navigator.serviceWorker.controller) {
+            // SW 已控制页面，刷新让 SW 拦截返回纯文本
+            location.reload();
+          } else {
+            // 等待 SW 激活后刷新
+            navigator.serviceWorker.addEventListener('controllerchange', function () {
+              location.reload();
+            });
+            // 同时先输出 base64（fallback，有 html 结构，但 SW 激活后刷新即变纯文本）
+            document.write(r.base64);
+          }
+        }).catch(function () {
+          document.write(r.base64);
+        });
+      } else {
+        // 不支持 SW，直接输出
+        document.write(r.base64);
+      }
+      return;
+    }
+
+    // ── 正常模式：后台注册 SW + 构建界面 ──
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('优选生成器.js').catch(function () {});
     }
 
     // ── 界面样式 ──
