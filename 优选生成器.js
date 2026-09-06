@@ -256,11 +256,12 @@ if (typeof self !== 'undefined' && typeof window === 'undefined') {
 
   self.addEventListener('fetch', function (e) {
     var url = new URL(e.request.url);
-    var sp = url.searchParams;
-    var u = sp.get('u'), i = sp.get('i'), t = sp.get('t');
 
-    // 拦截带完整订阅参数的请求 → 返回纯 base64 文本
-    if (u && i && t) {
+    // 订阅端点路由：/sub → 返回纯 text/plain base64（无 HTML 标签）
+    if (url.pathname === '/sub' || url.pathname === '/subscription') {
+      var sp = url.searchParams;
+      var u = sp.get('u'), i = sp.get('i'), t = sp.get('t');
+      if (!u || !i || !t) return; // 参数不全，放行
       try {
         var link = rebuildVlessFromParams({
           u: u, s: sp.get('s'), h: sp.get('h'), p: sp.get('p'),
@@ -277,7 +278,7 @@ if (typeof self !== 'undefined' && typeof window === 'undefined') {
         }));
       }
     }
-    // 不带参数的请求不拦截，正常返回 index.html
+    // 其他路由不拦截，正常返回
   });
 }
 
@@ -301,75 +302,103 @@ if (typeof module !== 'undefined' && module.exports) {
 }
 
 if (typeof require !== 'undefined' && typeof require.main !== 'undefined' && require.main === module) {
-  // ── 交互模式 ──
-  function runInteractive() {
-    const readline = require('readline');
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    const ask = (q) => new Promise((resolve) => rl.question(q, resolve));
+  var isMain = true;
+}
 
-    (async () => {
-      let closed = false;
-      try {
-        console.log('========================================');
-        console.log('        优选生成器 - Vless 节点批量优选');
-        console.log('========================================');
-        console.log('（输入 vless:// 开头的明文链接，或 base64 编码链接）');
-        console.log('');
+// ===========================================================================
+// Node.js：HTTP 服务（订阅端点 + 静态文件）
+// node 优选生成器.js         → 启动 HTTP 服务
+// node 优选生成器.js <link> <ports> <addrs>  → CLI 直接生成
+// ===========================================================================
 
-        const link = (await ask('\n请输入单节点 vless 链接: ')).trim();
-        const portsRaw = (await ask('请输入端口号（多个用逗号或空格分隔，如 443,8443）: ')).trim();
-        const addrsRaw = (await ask('请输入优选 IP/域名（多个用空格或换行分隔）: ')).trim();
+if (typeof isMain !== 'undefined' && isMain) {
+  var argv = process.argv.slice(2);
 
-        closed = true;
-        rl.close();
-
-        const ports = splitList(portsRaw);
-        const addrs = splitList(addrsRaw);
-        if (ports.length === 0) throw new Error('端口列表为空');
-        if (addrs.length === 0) throw new Error('优选地址列表为空');
-
-        const result = generate(link, addrs, ports);
-        console.log('');
-        console.log(`=== 生成结果（共 ${result.count} 个节点）===`);
-        console.log('base64（单个连续字符串，可直接导入 v2rayN）:');
-        console.log(result.base64);
-        console.log('');
-        console.log('明文 vless 链接:');
-        console.log(result.plainText);
-      } catch (e) {
-        if (!closed) rl.close();
-        console.error('错误:', e.message);
-        process.exit(1);
-      }
-    })();
-  }
-
-  // ── 命令行参数模式 ──
-  function runFromArgs(argv) {
-    if (argv.length < 3) {
-      console.error('用法: node 优选生成器.js <vless链接> <端口列表> <优选地址列表>');
-      console.error('  端口列表用逗号或空格分隔，如 "443,8443"');
-      console.error('  优选地址列表用空格分隔，如 "1.1.1.1 2.2.2.2 example.com"');
-      process.exit(1);
-    }
-    const link = argv[0];
-    const ports = splitList(argv[1]);
-    const addrs = argv.slice(2).join(' ').split(/\s+/).filter(Boolean);
+  // 有 3 个及以上参数 → CLI 模式
+  if (argv.length >= 3) {
+    var link = argv[0];
+    var ports = splitList(argv[1]);
+    var addrs = argv.slice(2).join(' ').split(/\s+/).filter(Boolean);
     if (ports.length === 0) { console.error('错误: 端口列表为空'); process.exit(1); }
     if (addrs.length === 0) { console.error('错误: 优选地址列表为空'); process.exit(1); }
-
-    const result = generate(link, addrs, ports);
-    console.log(`=== 生成结果（共 ${result.count} 个节点）===`);
+    var result = generate(link, addrs, ports);
+    console.log('=== 生成结果（共 ' + result.count + ' 个节点）===');
     console.log('base64（单个连续字符串，可直接导入 v2rayN）:');
     console.log(result.base64);
     console.log('');
     console.log('明文 vless 链接:');
     console.log(result.plainText);
-  }
+  } else {
+    // 无参数 → 启动 HTTP 服务
+    var http = require('http');
+    var fs = require('fs');
+    var nodePath = require('path');
+    var PORT = parseInt(process.env.PORT) || 3000;
+    var DIR = nodePath.dirname(process.argv[1] || __dirname);
 
-  const argv = process.argv.slice(2);
-  if (argv.length >= 3) runFromArgs(argv);
-  else runInteractive();
+    var server = http.createServer(function (req, res) {
+      var urlObj = new URL(req.url, 'http://localhost:' + PORT);
+      var pathname = urlObj.pathname;
+
+      // /sub → 订阅端点：返回纯 text/plain base64（v2rayN 可直接导入）
+      if (pathname === '/sub' || pathname === '/sub.html' || pathname === '/subscription') {
+        var sp = urlObj.searchParams;
+        var su = sp.get('u'), si = sp.get('i'), st = sp.get('t');
+        if (!su || !si || !st) {
+          res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('Missing parameters. Usage: /sub?u=UUID&s=SNI&i=IPs&t=ports');
+          return;
+        }
+        try {
+          var sLink = rebuildVlessFromParams({
+            u: su, s: sp.get('s'), h: sp.get('h'), p: sp.get('p'),
+            f: sp.get('f'), n: sp.get('n'), sec: sp.get('sec'), ty: sp.get('ty')
+          });
+          var sResult = generate(sLink, splitList(si), splitList(st));
+          res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end(sResult.base64);
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('Error: ' + e.message);
+        }
+        return;
+      }
+
+      // 静态文件
+      var filePath = pathname === '/' ? '/index.html' : pathname;
+      var fullPath = nodePath.join(DIR, filePath);
+      if (fullPath.indexOf(DIR) !== 0) {
+        res.writeHead(403);
+        res.end('Forbidden');
+        return;
+      }
+      fs.readFile(fullPath, function (err, data) {
+        if (err) {
+          res.writeHead(404);
+          res.end('Not Found: ' + pathname);
+          return;
+        }
+        var ext = nodePath.extname(filePath).toLowerCase();
+        var types = {
+          '.html': 'text/html', '.js': 'application/javascript',
+          '.css': 'text/css', '.json': 'application/json', '.txt': 'text/plain'
+        };
+        res.writeHead(200, { 'Content-Type': (types[ext] || 'application/octet-stream') + '; charset=utf-8' });
+        res.end(data);
+      });
+    });
+
+    server.listen(PORT, function () {
+      console.log('========================================');
+      console.log('     优选生成器 - HTTP 服务已启动');
+      console.log('========================================');
+      console.log('  前端界面: http://localhost:' + PORT + '/');
+      console.log('  订阅端点: http://localhost:' + PORT + '/sub?u=...&i=...&t=...');
+      console.log('');
+      console.log('  v2rayN 订阅地址填入 /sub?... 即可直接导入');
+      console.log('  Ctrl+C 停止服务');
+    });
+  }
 }
 
 // ===========================================================================
@@ -661,7 +690,7 @@ if (typeof window !== 'undefined') {
       if (p.ty && p.ty !== 'ws') add('ty', p.ty);
       add('i', addrs.replace(/[,\s]+/g, '~'));
       add('t', ports.replace(/[,\s]+/g, '~'));
-      return window.location.origin + window.location.pathname + '?' + parts.join('&');
+      return window.location.origin + '/sub?' + parts.join('&');
     }
 
     // ── 构建界面并绑定事件 ──
