@@ -3,13 +3,12 @@
  * 优选生成器 - Vless 节点批量优选工具（单文件，浏览器 + Node 双环境）
  *
  * 功能：
- *   根据一个 vless 节点链接 + 多个优选地址（IP/域名）+ 多个端口号，
- *   批量替换节点的 address:port 部分，生成 N × M 个优选节点，
- *   节点名自动递增编号，所有节点拼接后整体 base64 编码输出（单个连续字符串，可直接导入 v2rayN）。
+ *   根据一个或多个 vless 节点链接 + 多个优选地址（IP/域名）+ 多个端口号，
+ *   批量替换节点的 address:port 部分，生成 N × M × P 个优选节点，
+ *   节点名自动编号（CF01-1, CF01-2, CF02-1 ...），所有节点拼接后整体 base64 编码输出。
  *
  * ── 浏览器（index.html 引用本文件）──
- *   正常访问 index.html           → 构建前端界面，输入生成节点 + 订阅地址
- *   访问 index.html?u=...&i=...&t=... → 订阅模式：直接输出纯 base64 节点文本（无 UI、无 HTML 标签）
+ *   访问 index.html → 构建前端界面
  *
  * ── Node.js CLI ──
  *   用法 1（交互模式，默认）：
@@ -17,8 +16,8 @@
  *   用法 2（命令行参数）：
  *     node 优选生成器.js "vless://UUID@host:port?params#name" "443,8443" "addr1 addr2"
  *   作为模块：
- *     const { generate } = require('./优选生成器');
- *     const result = generate(link, ['1.1.1.1', '2.2.2.2'], [443, 8443]);
+ *     const { generate, generateAll, parseAddresses } = require('./优选生成器');
+ *     const result = generateAll(links, addresses, ports);
  */
 
 'use strict';
@@ -27,10 +26,6 @@
 // 核心函数（浏览器 / Node 通用）
 // ===========================================================================
 
-/**
- * Base64 编码（UTF-8 安全）
- * Node 用 Buffer，浏览器用 btoa
- */
 function b64Encode(s) {
   if (typeof Buffer !== 'undefined' && typeof Buffer.from === 'function') {
     return Buffer.from(String(s), 'utf-8').toString('base64');
@@ -38,9 +33,6 @@ function b64Encode(s) {
   return btoa(unescape(encodeURIComponent(String(s))));
 }
 
-/**
- * Base64 解码（UTF-8 安全）
- */
 function b64Decode(s) {
   if (typeof Buffer !== 'undefined' && typeof Buffer.from === 'function') {
     return Buffer.from(String(s), 'base64').toString('utf-8');
@@ -48,238 +40,240 @@ function b64Decode(s) {
   return decodeURIComponent(escape(atob(String(s))));
 }
 
-/**
- * 规范化输入：接受明文 vless 链接或 base64 编码的 vless 链接
- */
 function normalizeInput(link) {
   if (typeof link !== 'string') throw new Error('输入必须是字符串');
-  const s = link.trim();
+  var s = link.trim();
   if (!s) throw new Error('输入为空');
-  if (s.startsWith('vless://')) return s;
+  if (s.indexOf('vless://') === 0) return s;
   try {
-    const d = b64Decode(s).trim();
-    if (d.startsWith('vless://')) return d;
-  } catch (_) { /* ignore */ }
+    var d = b64Decode(s).trim();
+    if (d.indexOf('vless://') === 0) return d;
+  } catch (_) {}
   throw new Error('不是有效的 vless 链接（既不是明文也不是 base64）');
 }
 
 /**
  * 解析 vless 链接
  * 格式: vless://UUID@ADDRESS:PORT?PARAMS#NAME
- * @returns {{uuid:string,address:string,port:string,params:string,name:string}}
  */
 function parseVless(link) {
-  const s = normalizeInput(link);
-  const rest = s.slice('vless://'.length);
-
-  // 1. 分离 name（# 之后）
-  const hashIdx = rest.indexOf('#');
-  const beforeName = hashIdx >= 0 ? rest.slice(0, hashIdx) : rest;
-  const name = hashIdx >= 0 ? rest.slice(hashIdx + 1) : '';
-
-  // 2. 分离 params（? 之后，含 ?）
-  const qIdx = beforeName.indexOf('?');
-  const beforeParams = qIdx >= 0 ? beforeName.slice(0, qIdx) : beforeName;
-  const params = qIdx >= 0 ? beforeName.slice(qIdx) : '';
-
-  // 3. 分离 uuid 与 address:port
-  const atIdx = beforeParams.indexOf('@');
+  var s = normalizeInput(link);
+  var rest = s.slice('vless://'.length);
+  var hashIdx = rest.indexOf('#');
+  var beforeName = hashIdx >= 0 ? rest.slice(0, hashIdx) : rest;
+  var name = hashIdx >= 0 ? rest.slice(hashIdx + 1) : '';
+  var qIdx = beforeName.indexOf('?');
+  var beforeParams = qIdx >= 0 ? beforeName.slice(0, qIdx) : beforeName;
+  var params = qIdx >= 0 ? beforeName.slice(qIdx) : '';
+  var atIdx = beforeParams.indexOf('@');
   if (atIdx < 0) throw new Error('vless 链接格式错误：缺少 @');
-  const uuid = beforeParams.slice(0, atIdx);
-  const addrPort = beforeParams.slice(atIdx + 1);
-
-  // 4. 分离 address 与 port（支持 IPv6 [addr]:port）
-  let address, port;
-  if (addrPort.startsWith('[')) {
-    const closeIdx = addrPort.indexOf(']');
+  var uuid = beforeParams.slice(0, atIdx);
+  var addrPort = beforeParams.slice(atIdx + 1);
+  var address, port;
+  if (addrPort.charAt(0) === '[') {
+    var closeIdx = addrPort.indexOf(']');
     if (closeIdx < 0) throw new Error('IPv6 地址格式错误（缺少 ]）');
     address = addrPort.slice(1, closeIdx);
     port = addrPort.slice(closeIdx + 1).replace(/^:/, '');
   } else {
-    const colonIdx = addrPort.lastIndexOf(':');
+    var colonIdx = addrPort.lastIndexOf(':');
     if (colonIdx < 0) throw new Error('地址格式错误：缺少端口分隔符 :');
     address = addrPort.slice(0, colonIdx);
     port = addrPort.slice(colonIdx + 1);
   }
-
   if (!uuid) throw new Error('UUID 为空');
   if (!address) throw new Error('地址为空');
   if (!port) throw new Error('端口为空');
-
-  return { uuid, address, port, params, name };
+  return { uuid: uuid, address: address, port: port, params: params, name: name };
 }
 
 /**
- * 根据索引生成递增节点名
- * 规则：
- *   - 原名为空 → node_1, node_2, ...
- *   - 原名以 _数字 结尾（如 snippet_1）→ snippet_1, snippet_2, ...
- *   - 原名不以 _数字 结尾（如 My Node）→ My Node_1, My Node_2, ...
+ * 构建新的 vless 链接（替换 address:port，指定节点名）
  */
-function generateName(originalName, index) {
-  if (!originalName) return `node_${index + 1}`;
-  const match = originalName.match(/^(.*)_(\d+)$/);
-  if (match) return `${match[1]}_${index + 1}`;
-  return `${originalName}_${index + 1}`;
-}
-
-/**
- * 构建新的 vless 链接（替换 address 和 port，自动递增节点名）
- */
-function buildVless(originalLink, newAddress, newPort, nameIndex) {
-  const p = parseVless(originalLink);
+function buildVless(originalLink, newAddress, newPort, nodeName) {
+  var p = parseVless(originalLink);
   newAddress = String(newAddress).trim();
   newPort = String(newPort).trim();
   if (!newAddress) throw new Error('地址为空');
   if (!newPort) throw new Error('端口为空');
-  const addr = newAddress.includes(':') ? `[${newAddress}]` : newAddress;
-  const name = generateName(p.name, nameIndex);
-  const namePart = name ? `#${name}` : '';
-  return `vless://${p.uuid}@${addr}:${newPort}${p.params}${namePart}`;
+  var addr = newAddress.indexOf(':') >= 0 ? '[' + newAddress + ']' : newAddress;
+  var namePart = nodeName ? '#' + nodeName : '';
+  return 'vless://' + p.uuid + '@' + addr + ':' + newPort + p.params + namePart;
 }
 
 /**
- * 生成所有优选节点
- * 每个优选地址 × 每个端口 笛卡尔积组合，节点名自动递增编号，
- * 所有明文链接拼接（每个结尾 \r\n）后整体 base64 编码，返回单个连续字符串。
- * @returns {{base64:string, plainText:string, items:object[], count:number}}
+ * 根据索引生成递增节点名（兼容旧版，供外部调用）
  */
-function generate(originalLink, preferredAddresses, ports) {
-  if (!Array.isArray(preferredAddresses) || preferredAddresses.length === 0) {
-    throw new Error('优选地址列表为空');
-  }
-  if (!Array.isArray(ports) || ports.length === 0) {
-    throw new Error('端口列表为空');
-  }
+function generateName(originalName, index) {
+  if (!originalName) return 'node_' + (index + 1);
+  var m = originalName.match(/^(.*)_(\d+)$/);
+  if (m) return m[1] + '_' + (index + 1);
+  return originalName + '_' + (index + 1);
+}
 
-  const items = [];
-  let counter = 0;
-  for (const addr of preferredAddresses) {
-    if (!addr || !String(addr).trim()) continue;
-    for (const port of ports) {
-      if (port === '' || port === null || port === undefined) continue;
-      const newLink = buildVless(originalLink, addr, port, counter);
-      items.push({ plain: newLink, index: counter });
-      counter++;
+// ===========================================================================
+// 地址解析（智能过滤：从杂乱文本中提取 IP/域名 + 可选 #名称）
+// ===========================================================================
+
+/**
+ * 从杂乱文本中提取第一个有效的 IP 或域名
+ * 处理格式: "IP:port", "domain:port", "IP,xxx,yyy", "domain,xxx,yyy" 等
+ */
+function extractAddress(text) {
+  text = String(text).trim();
+  if (!text) return null;
+  // IPv4 (优先匹配)
+  var m = text.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
+  if (m) return m[1];
+  // 域名 (至少两段，首段以字母开头，排除纯数字如 0.00 / 66.57)
+  m = text.match(/[a-zA-Z][a-zA-Z0-9\-]*(?:\.[a-zA-Z0-9\-]+)*\.[a-zA-Z]{2,}/);
+  if (m) return m[0];
+  return null;
+}
+
+/**
+ * 解析优选地址文本（每行一个地址，自动过滤无关字符）
+ * 格式支持:
+ *   162.159.197.1:443#官方入口 | ZeroTrust
+ *   www.decathlon.com
+ *   104.24.2.167,4,4,0.00,66.57,16.36,HKG
+ *   104.24.2.167,4,4,0.00,66.57,104.31.16.240#优选节点
+ * 返回: [{ address: string, name: string }, ...]
+ */
+function parseAddresses(raw) {
+  var lines = String(raw).split(/\n/);
+  var results = [];
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    if (!line) continue;
+    var name = '';
+    var addrPart = line;
+    var hashIdx = line.indexOf('#');
+    if (hashIdx >= 0) {
+      addrPart = line.slice(0, hashIdx).trim();
+      name = line.slice(hashIdx + 1).trim();
+    }
+    // 按逗号分割，找第一个有效地址
+    var elements = addrPart.split(',');
+    var address = null;
+    for (var j = 0; j < elements.length; j++) {
+      var elem = elements[j].trim();
+      if (!elem) continue;
+      var addr = extractAddress(elem);
+      if (addr) { address = addr; break; }
+    }
+    if (address) {
+      results.push({ address: address, name: name });
+    }
+  }
+  return results;
+}
+
+// ===========================================================================
+// 多节点生成（核心生成函数）
+// ===========================================================================
+
+/**
+ * 根据多个原始节点 + 多个优选地址 + 多个端口，批量生成所有优选节点
+ * 命名规则: CF{节点序号}-{地址名称或计数器}
+ * @param {string[]} originalLinks  - 原始 vless 链接数组（支持多条）
+ * @param {Array<{address:string,name:string}>} addresses - 优选地址数组
+ * @param {string[]} ports          - 端口号数组
+ * @returns {{base64:string, plainText:string, items:Array, count:number}}
+ */
+function generateAll(originalLinks, addresses, ports) {
+  if (!originalLinks || !originalLinks.length) throw new Error('原始节点列表为空');
+  if (!addresses || !addresses.length) throw new Error('优选地址列表为空');
+  if (!ports || !ports.length) throw new Error('端口列表为空');
+
+  var allItems = [];
+
+  for (var ni = 0; ni < originalLinks.length; ni++) {
+    var nodeIdx = ni + 1;
+    var nodePrefix = 'CF' + (nodeIdx < 10 ? '0' : '') + nodeIdx;
+    var counter = 0;
+
+    for (var ai = 0; ai < addresses.length; ai++) {
+      var addr = addresses[ai];
+      for (var pi = 0; pi < ports.length; pi++) {
+        counter++;
+        var nodeName;
+        if (addr.name) {
+          nodeName = nodePrefix + '-' + addr.name;
+          if (ports.length > 1) nodeName += '-' + (pi + 1);
+        } else {
+          nodeName = nodePrefix + '-' + counter;
+        }
+        var newLink = buildVless(originalLinks[ni], addr.address, ports[pi], nodeName);
+        allItems.push({ plain: newLink, index: counter, nodeIdx: nodeIdx });
+      }
     }
   }
 
-  const plainText = items.map(item => item.plain + '\r\n').join('');
+  var plainText = allItems.map(function(item) { return item.plain + '\r\n'; }).join('');
   return {
     base64: b64Encode(plainText),
     plainText: plainText,
-    items: items,
-    count: items.length
+    items: allItems,
+    count: allItems.length
   };
 }
 
 /**
- * 拆分列表字符串：支持 ~（订阅链接用）、逗号、空格、制表符分隔
+ * 兼容旧版 generate（单节点 + 字符串地址列表）
  */
+function generate(originalLink, preferredAddresses, ports) {
+  var links = [originalLink];
+  var addrs = [];
+  for (var i = 0; i < preferredAddresses.length; i++) {
+    var parsed = parseAddresses(String(preferredAddresses[i]));
+    if (parsed.length) addrs.push(parsed[0]);
+  }
+  return generateAll(links, addrs, ports);
+}
+
+// ===========================================================================
+// 工具函数
+// ===========================================================================
+
 function splitList(raw) {
   return String(raw).split(/[~,\s]+/).filter(Boolean);
 }
 
-// ===========================================================================
-// 订阅链接参数（浏览器使用；纯函数部分 Node 也可用）
-// ===========================================================================
-
 /**
- * 从 vless 链接提取订阅所需的关键参数
+ * 从文本中解析多条 vless 链接（每行一条，支持明文和 base64）
  */
-function extractParams(link) {
-  const p = parseVless(link);
-  const q = p.params.slice(1);
-  const query = {};
-  for (const pair of q.split('&')) {
-    const eq = pair.indexOf('=');
-    if (eq >= 0) query[pair.slice(0, eq)] = pair.slice(eq + 1);
-  }
-  const nm = p.name.match(/^(.*)_\d+$/);
-  let path = query.path || '';
-  try { path = decodeURIComponent(path); } catch (_) {}
-  return {
-    u: p.uuid,
-    s: query.sni || '',
-    h: query.host || '',
-    p: path,
-    f: query.fp || '',
-    n: nm ? nm[1] : p.name,
-    sec: query.security || '',
-    ty: query.type || ''
-  };
-}
-
-/**
- * 根据订阅参数重建 vless 链接（address 用占位符，生成时替换）
- */
-function rebuildVlessFromParams(params) {
-  const sni = params.s || params.h || '';
-  const host = params.h || params.s || '';
-  const path = params.p || '/';
-  const fp = params.f || 'chrome';
-  const sec = params.sec || 'tls';
-  const ty = params.ty || 'ws';
-  const name = params.n || '';
-  return 'vless://' + params.u + '@localhost:443?encryption=none&security=' + sec +
-    '&sni=' + sni + '&fp=' + fp + '&type=' + ty + '&host=' + host +
-    '&path=' + encodeURIComponent(path) + (name ? '#' + name : '');
-}
-
-/**
- * 读取 URL 参数（浏览器）
- * @returns {null | {link:string, addresses:string, ports:string}}
- */
-function readUrlParams() {
-  const sp = new URLSearchParams(window.location.search);
-  const u = sp.get('u'), s = sp.get('s'), h = sp.get('h'), p = sp.get('p'),
-        f = sp.get('f'), n = sp.get('n'), sec = sp.get('sec'), ty = sp.get('ty'),
-        i = sp.get('i'), t = sp.get('t');
-  if (!u && !s && !i && !t) return null;
-  return {
-    uuid: u,
-    link: rebuildVlessFromParams({ u, s, h, p, f, n, sec, ty }),
-    addresses: i ? i.replace(/[~,\s]+/g, '\n') : '',
-    ports: t ? t.replace(/[~,\s]+/g, '\n') : ''
-  };
-}
-
-// ===========================================================================
-// Service Worker：拦截带订阅参数的请求，返回纯 text/plain base64（无 HTML）
-// 同一个 JS 文件被 navigator.serviceWorker.register() 加载为 SW 脚本
-// ===========================================================================
-
-if (typeof self !== 'undefined' && typeof window === 'undefined') {
-  // SW 环境：self 存在但 window 不存在
-  self.addEventListener('install', function (e) { self.skipWaiting(); });
-  self.addEventListener('activate', function (e) { e.waitUntil(self.clients.claim()); });
-
-  self.addEventListener('fetch', function (e) {
-    var url = new URL(e.request.url);
-
-    // 订阅端点路由：/sub → 返回纯 text/plain base64（无 HTML 标签）
-    if (url.pathname === '/sub' || url.pathname === '/subscription') {
-      var sp = url.searchParams;
-      var u = sp.get('u'), i = sp.get('i'), t = sp.get('t');
-      if (!u || !i || !t) return; // 参数不全，放行
-      try {
-        var link = rebuildVlessFromParams({
-          u: u, s: sp.get('s'), h: sp.get('h'), p: sp.get('p'),
-          f: sp.get('f'), n: sp.get('n'), sec: sp.get('sec'), ty: sp.get('ty')
-        });
-        var r = generate(link, splitList(i), splitList(t));
-        e.respondWith(new Response(r.base64, {
-          headers: { 'Content-Type': 'text/plain; charset=utf-8' }
-        }));
-      } catch (err) {
-        e.respondWith(new Response('Error: ' + err.message, {
-          status: 500,
-          headers: { 'Content-Type': 'text/plain; charset=utf-8' }
-        }));
-      }
+function parseLinks(raw) {
+  var lines = String(raw).split(/\n/);
+  var links = [];
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    if (!line) continue;
+    try {
+      links.push(normalizeInput(line));
+    } catch (e) {
+      // 跳过无效行
     }
-    // 其他路由不拦截，正常返回
-  });
+  }
+  return links;
+}
+
+/**
+ * 根据参数构建 vless 链接（用于"填写参数"模式）
+ */
+function buildLinkFromParams(params) {
+  var uuid = params.uuid || '';
+  var host = params.host || '';
+  if (!uuid || !host) throw new Error('UUID 和 HOST 不能为空');
+  var path = params.path || '/';
+  var sec = params.security || 'tls';
+  var type = params.type || 'ws';
+  var fp = params.fp || 'chrome';
+  var name = params.name || '';
+  return 'vless://' + uuid + '@localhost:443?encryption=none&security=' + sec +
+    '&sni=' + host + '&fp=' + fp + '&type=' + type +
+    '&host=' + host + '&path=' + encodeURIComponent(path) +
+    (name ? '#' + name : '');
 }
 
 // ===========================================================================
@@ -288,166 +282,99 @@ if (typeof self !== 'undefined' && typeof window === 'undefined') {
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
+    b64Encode,
+    b64Decode,
     normalizeInput,
     parseVless,
     buildVless,
     generateName,
-    b64Encode,
-    b64Decode,
+    parseAddresses,
+    extractAddress,
+    generateAll,
     generate,
     splitList,
-    extractParams,
-    rebuildVlessFromParams,
+    parseLinks,
+    buildLinkFromParams,
   };
 }
 
 if (typeof require !== 'undefined' && typeof require.main !== 'undefined' && require.main === module) {
-  var isMain = true;
-}
-
-// ===========================================================================
-// Node.js：HTTP 服务（订阅端点 + 静态文件）
-// node 优选生成器.js         → 启动 HTTP 服务
-// node 优选生成器.js <link> <ports> <addrs>  → CLI 直接生成
-// ===========================================================================
-
-if (typeof isMain !== 'undefined' && isMain) {
   var argv = process.argv.slice(2);
 
-  // 有 3 个及以上参数 → CLI 模式
   if (argv.length >= 3) {
+    // CLI 参数模式
     var link = argv[0];
     var ports = splitList(argv[1]);
-    var addrs = argv.slice(2).join(' ').split(/\s+/).filter(Boolean);
-    if (ports.length === 0) { console.error('错误: 端口列表为空'); process.exit(1); }
-    if (addrs.length === 0) { console.error('错误: 优选地址列表为空'); process.exit(1); }
-    var result = generate(link, addrs, ports);
+    var addrs = parseAddresses(argv.slice(2).join('\n'));
+    if (!ports.length) { console.error('错误: 端口列表为空'); process.exit(1); }
+    if (!addrs.length) { console.error('错误: 优选地址列表为空'); process.exit(1); }
+    var result = generateAll([link], addrs, ports);
     console.log('=== 生成结果（共 ' + result.count + ' 个节点）===');
-    console.log('base64（单个连续字符串，可直接导入 v2rayN）:');
+    console.log('base64:');
     console.log(result.base64);
     console.log('');
     console.log('明文 vless 链接:');
     console.log(result.plainText);
   } else {
-    // 无参数 → 启动 HTTP 服务
-    var http = require('http');
-    var fs = require('fs');
-    var nodePath = require('path');
-    var PORT = parseInt(process.env.PORT) || 3000;
-    var DIR = nodePath.dirname(process.argv[1] || __dirname);
+    // 交互模式
+    var readline = require('readline');
+    var rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    var ask = function(q) { return new Promise(function(resolve) { rl.question(q, resolve); }); };
 
-    var server = http.createServer(function (req, res) {
-      var urlObj = new URL(req.url, 'http://localhost:' + PORT);
-      var pathname = urlObj.pathname;
+    (async function() {
+      var closed = false;
+      try {
+        console.log('========================================');
+        console.log('        优选生成器 - Vless 节点批量优选');
+        console.log('========================================');
+        console.log('（每行输入一条 vless 链接，空行结束）');
+        console.log('');
+        var lines = [];
+        while (true) {
+          var line = (await ask('> ')).trim();
+          if (!line) break;
+          lines.push(line);
+        }
+        closed = true;
+        rl.close();
+        if (!lines.length) { console.log('未输入任何节点'); process.exit(0); }
+        var links = parseLinks(lines.join('\n'));
+        if (!links.length) { console.error('错误: 无有效节点'); process.exit(1); }
 
-      // /sub → 订阅端点：返回纯 text/plain base64（v2rayN 可直接导入）
-      if (pathname === '/sub' || pathname === '/sub.html' || pathname === '/subscription') {
-        var sp = urlObj.searchParams;
-        var su = sp.get('u'), si = sp.get('i'), st = sp.get('t');
-        if (!su || !si || !st) {
-          res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-          res.end('Missing parameters. Usage: /sub?u=UUID&s=SNI&i=IPs&t=ports');
-          return;
-        }
-        try {
-          var sLink = rebuildVlessFromParams({
-            u: su, s: sp.get('s'), h: sp.get('h'), p: sp.get('p'),
-            f: sp.get('f'), n: sp.get('n'), sec: sp.get('sec'), ty: sp.get('ty')
-          });
-          var sResult = generate(sLink, splitList(si), splitList(st));
-          res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-          res.end(sResult.base64);
-        } catch (e) {
-          res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-          res.end('Error: ' + e.message);
-        }
-        return;
+        var portsRaw = (await ask('端口号（多个用逗号或空格分隔，如 443,8443）: ')).trim();
+        var addrsRaw = (await ask('优选地址（每行一个，支持 #名称 格式）: ')).trim();
+
+        closed = true;
+        rl.close();
+        var ports = splitList(portsRaw);
+        var addrs = parseAddresses(addrsRaw);
+        if (!ports.length) throw new Error('端口列表为空');
+        if (!addrs.length) throw new Error('优选地址列表为空');
+
+        var result = generateAll(links, addrs, ports);
+        console.log('');
+        console.log('=== 生成结果（共 ' + result.count + ' 个节点）===');
+        console.log('base64:');
+        console.log(result.base64);
+        console.log('');
+        console.log('明文 vless 链接:');
+        console.log(result.plainText);
+      } catch (e) {
+        if (!closed) rl.close();
+        console.error('错误:', e.message);
+        process.exit(1);
       }
-
-      // 静态文件
-      var filePath = pathname === '/' ? '/index.html' : pathname;
-      var fullPath = nodePath.join(DIR, filePath);
-      if (fullPath.indexOf(DIR) !== 0) {
-        res.writeHead(403);
-        res.end('Forbidden');
-        return;
-      }
-      fs.readFile(fullPath, function (err, data) {
-        if (err) {
-          res.writeHead(404);
-          res.end('Not Found: ' + pathname);
-          return;
-        }
-        var ext = nodePath.extname(filePath).toLowerCase();
-        var types = {
-          '.html': 'text/html', '.js': 'application/javascript',
-          '.css': 'text/css', '.json': 'application/json', '.txt': 'text/plain'
-        };
-        res.writeHead(200, { 'Content-Type': (types[ext] || 'application/octet-stream') + '; charset=utf-8' });
-        res.end(data);
-      });
-    });
-
-    server.listen(PORT, function () {
-      console.log('========================================');
-      console.log('     优选生成器 - HTTP 服务已启动');
-      console.log('========================================');
-      console.log('  前端界面: http://localhost:' + PORT + '/');
-      console.log('  订阅端点: http://localhost:' + PORT + '/sub?u=...&i=...&t=...');
-      console.log('');
-      console.log('  v2rayN 订阅地址填入 /sub?... 即可直接导入');
-      console.log('  Ctrl+C 停止服务');
-    });
+    })();
   }
 }
 
 // ===========================================================================
-// 浏览器：订阅端点 + 前端界面（index.html 为空壳，所有 UI 由本文件构建）
+// 浏览器：前端界面（index.html 为空壳，所有 UI 由本文件构建）
 // ===========================================================================
 
 if (typeof window !== 'undefined') {
   (function () {
     'use strict';
-
-    var params = readUrlParams();
-
-    // ── 订阅模式 ──
-    // 注册 SW；SW 激活后拦截请求返回纯 text/plain base64（无任何 HTML 标签）
-    if (params && params.uuid && params.addresses && params.ports) {
-      try {
-        var r = generate(params.link, splitList(params.addresses), splitList(params.ports));
-      } catch (e) {
-        document.write('Error: ' + e.message);
-        return;
-      }
-
-      if ('serviceWorker' in navigator) {
-        navigator.serviceWorker.register('优选生成器.js').then(function (reg) {
-          if (navigator.serviceWorker.controller) {
-            // SW 已控制页面，刷新让 SW 拦截返回纯文本
-            location.reload();
-          } else {
-            // 等待 SW 激活后刷新
-            navigator.serviceWorker.addEventListener('controllerchange', function () {
-              location.reload();
-            });
-            // 同时先输出 base64（fallback，有 html 结构，但 SW 激活后刷新即变纯文本）
-            document.write(r.base64);
-          }
-        }).catch(function () {
-          document.write(r.base64);
-        });
-      } else {
-        // 不支持 SW，直接输出
-        document.write(r.base64);
-      }
-      return;
-    }
-
-    // ── 正常模式：后台注册 SW + 构建界面 ──
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('优选生成器.js').catch(function () {});
-    }
 
     // ── 界面样式 ──
     var UI_CSS =
@@ -462,9 +389,10 @@ if (typeof window !== 'undefined') {
       '.card h2{font-size:15px;font-weight:600;margin-bottom:12px;display:flex;align-items:center;gap:8px}' +
       '.card h2 .num{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;background:var(--accent);color:#fff;font-size:13px;font-weight:700}' +
       'label{display:block;font-size:13px;color:var(--text-dim);margin-bottom:6px}' +
-      'textarea{width:100%;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:12px 14px;font-size:14px;font-family:"SF Mono","Cascadia Code",Consolas,monospace;resize:vertical;transition:border-color .2s,box-shadow .2s;outline:none}' +
+      'textarea{width:100%;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:12px 14px;font-size:13px;font-family:"SF Mono","Cascadia Code",Consolas,monospace;resize:vertical;transition:border-color .2s,box-shadow .2s;outline:none;min-height:88px}' +
       'textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-glow)}' +
-      'textarea{min-height:88px}' +
+      'input[type=text],select{width:100%;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px;font-size:13px;outline:none;transition:border-color .2s}' +
+      'input[type=text]:focus,select:focus{border-color:var(--accent)}' +
       '.hint{font-size:12px;color:var(--text-dim);margin-top:6px;line-height:1.5}' +
       '.hint code{background:var(--bg-input);padding:1px 6px;border-radius:4px;font-size:11px}' +
       '.btn-group{display:flex;gap:10px;flex-wrap:wrap;align-items:center}' +
@@ -489,7 +417,6 @@ if (typeof window !== 'undefined') {
       '.section-label .tag{font-size:11px;padding:2px 8px;border-radius:4px;font-weight:600}' +
       '.tag-b64{background:rgba(74,222,128,.15);color:var(--success)}' +
       '.tag-plain{background:rgba(251,191,36,.15);color:var(--warning)}' +
-      '.tag-url{background:rgba(91,157,255,.15);color:var(--accent)}' +
       '.toggle-row{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-dim);margin:14px 0 4px}' +
       '.toggle-row input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent);cursor:pointer}' +
       '.error-msg{color:var(--danger);font-size:13px;margin-top:10px;padding:10px 14px;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.3);border-radius:8px;display:none}' +
@@ -497,71 +424,133 @@ if (typeof window !== 'undefined') {
       'footer{text-align:center;color:var(--text-dim);font-size:12px;margin-top:32px;padding-top:18px;border-top:1px solid var(--border)}' +
       '.format-note{font-size:12px;color:var(--text-dim);margin-top:8px;padding:8px 12px;background:rgba(91,157,255,.08);border-left:3px solid var(--accent);border-radius:4px}' +
       '.format-note b{color:var(--accent)}' +
-      '.url-length{font-size:12px;color:var(--text-dim);margin-top:6px}' +
-      '.url-length b{color:var(--warning)}';
+      /* 模式切换 */
+      '.mode-toggle{display:flex;gap:0;margin-bottom:14px}' +
+      '.mode-option{flex:1;text-align:center;padding:10px 16px;font-size:13px;font-weight:600;cursor:pointer;border:1px solid var(--border);color:var(--text-dim);transition:all .2s;user-select:none}' +
+      '.mode-option:first-child{border-radius:8px 0 0 8px}' +
+      '.mode-option:last-child{border-radius:0 8px 8px 0}' +
+      '.mode-option.active{background:var(--accent);color:#fff;border-color:var(--accent)}' +
+      '.mode-option:not(.active):hover{background:var(--bg-input)}' +
+      '.mode-content{display:none}' +
+      '.mode-content.active{display:block}' +
+      /* 参数网格 */
+      '.param-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}' +
+      '.param-field{display:flex;flex-direction:column}' +
+      '.param-field label{margin-bottom:4px}' +
+      /* 端口复选框 */
+      '.port-checks{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px}' +
+      '.port-check{display:flex;align-items:center;gap:6px;padding:8px 14px;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-size:13px;transition:all .2s;user-select:none}' +
+      '.port-check:hover{border-color:var(--accent)}' +
+      '.port-check input{width:16px;height:16px;accent-color:var(--accent)}' +
+      '.port-check.checked{border-color:var(--accent);background:rgba(91,157,255,.1)}' +
+      /* 地址格式说明 */
+      '.addr-format{font-size:12px;color:var(--text-dim);margin-top:10px;padding:10px 12px;background:rgba(91,157,255,.06);border:1px solid rgba(91,157,255,.15);border-radius:8px;line-height:1.8}' +
+      '.addr-format b{color:var(--accent)}' +
+      '.addr-format code{background:var(--bg-input);padding:2px 6px;border-radius:4px;font-size:11px}' +
+      /* 节点计数 */
+      '.node-list{font-size:12px;color:var(--text-dim);margin-top:8px;padding:8px 12px;background:var(--bg-input);border-radius:6px;max-height:120px;overflow-y:auto}' +
+      '.node-list-item{display:flex;justify-content:space-between;gap:8px;padding:2px 0}' +
+      '.node-list-item .idx{color:var(--accent);font-weight:600}' +
+      '.node-list-item .nm{color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+      '@media(max-width:600px){.param-grid{grid-template-columns:1fr}.port-checks{gap:6px}.port-check{padding:6px 10px;font-size:12px}}';
 
-    // ── 界面标记 ──
+    // ── 界面 HTML ──
     var UI_HTML =
       '<div class="container">' +
-        '<header>' +
-          '<h1>⚡ 优选生成器</h1>' +
-          '<p>Vless 节点批量优选 · 一键生成 base64 订阅</p>' +
-        '</header>' +
-        '<div class="card">' +
-          '<h2><span class="num">1</span> 原始节点链接</h2>' +
-          '<label for="inputLink">粘贴单条 vless 链接（明文或 base64 均可）</label>' +
-          '<textarea id="inputLink" placeholder="vless://56c61d17-676b-4941-b6ef-5648b16b3d22@dy2.galloner1.eu.org:443?encryption=none&security=tls&sni=dy2.galloner1.eu.org&fp=chrome&type=ws&host=dy2.galloner1.eu.org&path=%2F%3Fed%3D2048#snippet_1"></textarea>' +
-          '<div class="hint">支持直接粘贴 <code>vless://...</code> 明文链接，或 base64 编码链接（自动解码）。</div>' +
-        '</div>' +
-        '<div class="card">' +
-          '<h2><span class="num">2</span> 优选地址（IP / 域名）</h2>' +
-          '<label for="inputAddresses">每个地址生成一组节点</label>' +
-          '<textarea id="inputAddresses" placeholder="104.24.5.149&#10;bestcf.030101.xyz&#10;example.com"></textarea>' +
-          '<div class="hint">每行一个地址，或用空格 / 逗号分隔。</div>' +
-        '</div>' +
-        '<div class="card">' +
-          '<h2><span class="num">3</span> 端口号</h2>' +
-          '<label for="inputPorts">每个端口都会与每个地址组合</label>' +
-          '<textarea id="inputPorts" style="min-height:56px" placeholder="443,8443,2053"></textarea>' +
-          '<div class="hint">多个端口用逗号或空格分隔，如 <code>443,8443,2053</code>。</div>' +
-        '</div>' +
-        '<div class="btn-group primary">' +
-          '<button id="generateBtn">🚀 一键生成优选节点</button>' +
-        '</div>' +
-        '<div class="card">' +
-          '<div class="output-toolbar">' +
-            '<h2 style="margin:0"><span class="num">✓</span> 生成结果</h2>' +
-            '<div class="stats">共 <span class="count" id="count">0</span> 个节点</div>' +
-          '</div>' +
-          '<div class="error-msg" id="errorMsg"></div>' +
-          '<div class="format-note">base64 输出为<b>单个连续字符串</b>（所有节点拼接后整体编码），可直接复制导入 v2rayN。</div>' +
-          '<div class="section-label" style="margin-top:14px"><span class="tag tag-b64">base64</span> 订阅链接（单个字符串，可直接导入）</div>' +
-          '<div class="output-area"><textarea id="outputBase64" readonly placeholder="生成的 base64 订阅链接将显示在此处..."></textarea></div>' +
-          '<div id="subUrlSection" style="display:none">' +
-            '<div class="section-label" style="margin-top:14px"><span class="tag tag-url">url</span> 订阅地址（访问即返回节点数据）</div>' +
-            '<div class="output-area"><textarea id="subUrlDisplay" readonly style="min-height:52px;font-size:12px" placeholder="订阅地址将显示在此处..."></textarea></div>' +
-            '<div class="url-length">URL 长度：<b id="urlLen">0</b> 字符</div>' +
-          '</div>' +
-          '<div class="toggle-row"><label><input type="checkbox" id="showPlain"> 显示明文 vless 链接</label></div>' +
-          '<div id="plainSection" style="display:none">' +
-            '<div class="section-label"><span class="tag tag-plain">plain</span> 明文 vless 链接（每行一个节点）</div>' +
-            '<div class="output-area"><textarea id="outputPlain" readonly placeholder="明文 vless 链接将显示在此处..."></textarea></div>' +
-          '</div>' +
-          '<div class="btn-group" style="margin-top:14px">' +
-            '<button class="secondary" id="copyBtn">📋 复制 base64</button>' +
-            '<button class="secondary" id="copySubBtn">🔗 复制订阅地址</button>' +
-            '<button class="secondary" id="copyPlainBtn">📋 复制明文</button>' +
-            '<button class="secondary" id="downloadBtn">💾 下载</button>' +
-            '<button class="secondary" id="clearBtn">🗑️ 清空</button>' +
-          '</div>' +
-        '</div>' +
-        '<footer>优选生成器 · 纯前端本地运行 · 数据不会离开你的浏览器</footer>' +
+      '<header>' +
+      '<h1>⚡ 优选生成器</h1>' +
+      '<p>Vless 节点批量优选 · 一键生成 base64 订阅</p>' +
+      '</header>' +
+      // Card 1: 原始节点
+      '<div class="card">' +
+      '<h2><span class="num">1</span> 原始节点</h2>' +
+      '<div class="mode-toggle" id="modeToggle">' +
+      '<span class="mode-option active" data-mode="paste">📋 粘贴原始节点</span>' +
+      '<span class="mode-option" data-mode="params">⚙️ 填写参数</span>' +
+      '</div>' +
+      '<div id="pasteMode" class="mode-content active">' +
+      '<label for="inputLinks">粘贴 vless 链接（支持多行，每行一个节点）</label>' +
+      '<textarea id="inputLinks" placeholder="vless://xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx@your-host.com:443?encryption=none&#38;security=tls&#38;sni=your-host.com&#38;fp=chrome&#38;type=ws&#38;host=your-host.com&#38;path=/#MyNode"></textarea>' +
+      '<div class="hint">支持直接粘贴 <code>vless://...</code> 明文链接，或 base64 编码链接（自动解码）。每行一个节点。</div>' +
+      '</div>' +
+      '<div id="paramsMode" class="mode-content">' +
+      '<div class="param-grid">' +
+      '<div class="param-field"><label>UUID *</label><input type="text" id="paramUUID" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"></div>' +
+      '<div class="param-field"><label>HOST / SNI *</label><input type="text" id="paramHost" placeholder="your-host.com"></div>' +
+      '<div class="param-field"><label>Path</label><input type="text" id="paramPath" placeholder="/" value="/"></div>' +
+      '<div class="param-field"><label>名称</label><input type="text" id="paramName" placeholder="My Node"></div>' +
+      '<div class="param-field"><label>安全</label><select id="paramSec"><option value="tls">TLS</option><option value="reality">Reality</option><option value="none">None</option></select></div>' +
+      '<div class="param-field"><label>传输</label><select id="paramType"><option value="ws">WebSocket</option><option value="http">HTTP</option></select></div>' +
+      '<div class="param-field"><label>指纹</label><select id="paramFP"><option value="chrome">Chrome</option><option value="firefox">Firefox</option><option value="safari">Safari</option><option value="ios">iOS</option><option value="android">Android</option><option value="random">Random</option></select></div>' +
+      '<div class="param-field" style="opacity:0;pointer-events:none"><input type="text" disabled></div>' +
+      '</div>' +
+      '<div class="hint" style="margin-top:8px">* 为必填项。填写后自动生成 vless 链接用于优选。</div>' +
+      '</div>' +
+      '</div>' +
+      // Card 2: 优选地址
+      '<div class="card">' +
+      '<h2><span class="num">2</span> 优选地址（IP / 域名）</h2>' +
+      '<label for="inputAddresses">每行一个地址，支持 #名称 格式</label>' +
+      '<textarea id="inputAddresses" placeholder="加载中..."></textarea>' +
+      '<div class="addr-format">' +
+      '<b>支持的格式：</b><br>' +
+      '<code>162.159.197.1:443#官方入口 | ZeroTrust</code> — IP + 名称<br>' +
+      '<code>www.decathlon.com:443#企业域名 | 迪卡侬</code> — 域名 + 名称<br>' +
+      '<code>104.24.2.167,4,4,0.00,66.57,16.36,HKG</code> — 自动提取 IP<br>' +
+      '<code>104.24.2.167,4,4,0.00,66.57,104.31.16.240#优选节点</code> — 多 IP 取第一个<br>' +
+      '<br><b>规则：</b>每行识别一个地址，# 后为名称（写入节点名），无关字符自动过滤。' +
+      '</div>' +
+      '</div>' +
+      // Card 3: 端口号
+      '<div class="card">' +
+      '<h2><span class="num">3</span> 端口号</h2>' +
+      '<label>选择 Cloudflare 支持的端口（可多选）</label>' +
+      '<div class="port-checks" id="portChecks">' +
+      '<label class="port-check checked"><input type="checkbox" value="443" checked> 443</label>' +
+      '<label class="port-check"><input type="checkbox" value="8443"> 8443</label>' +
+      '<label class="port-check"><input type="checkbox" value="2053"> 2053</label>' +
+      '<label class="port-check"><input type="checkbox" value="2083"> 2083</label>' +
+      '<label class="port-check"><input type="checkbox" value="2087"> 2087</label>' +
+      '<label class="port-check"><input type="checkbox" value="2096"> 2096</label>' +
+      '</div>' +
+      '</div>' +
+      // 生成按钮
+      '<div class="btn-group primary">' +
+      '<button id="generateBtn">🚀 一键生成优选节点</button>' +
+      '</div>' +
+      // 结果
+      '<div class="card">' +
+      '<div class="output-toolbar">' +
+      '<h2 style="margin:0"><span class="num">✓</span> 生成结果</h2>' +
+      '<div class="stats">共 <span class="count" id="count">0</span> 个节点</div>' +
+      '</div>' +
+      '<div class="error-msg" id="errorMsg"></div>' +
+      '<div class="format-note">base64 输出为<b>单个连续字符串</b>（所有节点拼接后整体编码），可直接复制导入 v2rayN。</div>' +
+      '<div class="section-label" style="margin-top:14px"><span class="tag tag-b64">base64</span> 订阅数据（单个字符串，可直接导入）</div>' +
+      '<div class="output-area"><textarea id="outputBase64" readonly placeholder="生成的 base64 将显示在此处..."></textarea></div>' +
+      '<div class="toggle-row"><label><input type="checkbox" id="showPlain"> 显示明文 vless 链接</label></div>' +
+      '<div id="plainSection" style="display:none">' +
+      '<div class="section-label"><span class="tag tag-plain">plain</span> 明文 vless 链接（每行一个节点）</div>' +
+      '<div class="output-area"><textarea id="outputPlain" readonly placeholder="明文 vless 链接将显示在此处..."></textarea></div>' +
+      '</div>' +
+      '<div id="nodeListSection" style="display:none">' +
+      '<div class="section-label" style="margin-top:14px">📋 节点列表</div>' +
+      '<div class="node-list" id="nodeList"></div>' +
+      '</div>' +
+      '<div class="btn-group" style="margin-top:14px">' +
+      '<button class="secondary" id="copyBtn">📋 复制 base64</button>' +
+      '<button class="secondary" id="copyPlainBtn">📋 复制明文</button>' +
+      '<button class="secondary" id="downloadBtn">💾 下载</button>' +
+      '<button class="secondary" id="clearBtn">🗑️ 清空</button>' +
+      '</div>' +
+      '</div>' +
+      '<footer>优选生成器 · 纯前端本地运行 · 数据不会离开你的浏览器</footer>' +
       '</div>' +
       '<div class="toast" id="toast"></div>';
 
     // ── DOM 工具 ──
     function $(id) { return document.getElementById(id); }
-    var _subUrl = '';
+    var currentMode = 'paste';
 
     function showToast(m) {
       var t = $('toast');
@@ -576,35 +565,102 @@ if (typeof window !== 'undefined') {
       else { el.classList.remove('show'); el.textContent = ''; }
     }
 
-    // ── 生成 ──
+    // ── 预填默认地址（从 bestcf 获取，失败则用硬编码）──
+    var DEFAULT_ADDRESSES = [
+      '162.159.197.1:443#官方入口 | ZeroTrust',
+      '162.159.198.1:443#官方入口 | MASQUE',
+      'www.decathlon.com:443#企业域名 | 迪卡侬',
+      'www.asda.com:443#企业域名 | 阿斯达',
+      'serviceshub.samsclub.com:443#企业域名 | 山姆会员'
+    ];
+
+    function loadDefaultAddresses() {
+      if (typeof fetch !== 'undefined') {
+        fetch('https://bestcf.pages.dev/domain/mini.txt')
+          .then(function (r) { return r.text(); })
+          .then(function (text) {
+            var lines = text.trim().split(/\n/).filter(Boolean).slice(0, 5);
+            if (lines.length) $('inputAddresses').value = lines.join('\n');
+          })
+          .catch(function () {
+            $('inputAddresses').value = DEFAULT_ADDRESSES.join('\n');
+          });
+      } else {
+        $('inputAddresses').value = DEFAULT_ADDRESSES.join('\n');
+      }
+    }
+
+    // ── 获取选中的端口 ──
+    function getSelectedPorts() {
+      var checks = document.querySelectorAll('#portChecks input[type=checkbox]:checked');
+      var ports = [];
+      for (var i = 0; i < checks.length; i++) ports.push(checks[i].value);
+      return ports;
+    }
+
+    // ── 生成处理 ──
     function handleGenerate() {
       showError('');
-      var link = $('inputLink').value.trim();
-      var addrs = splitList($('inputAddresses').value);
-      var ports = splitList($('inputPorts').value);
-      if (!link) { showError('请粘贴 vless 节点链接'); return; }
-      if (!addrs.length) { showError('请填写至少一个优选地址'); return; }
-      if (!ports.length) { showError('请填写至少一个端口号'); return; }
+      var links;
+      if (currentMode === 'paste') {
+        links = parseLinks($('inputLinks').value);
+      } else {
+        try {
+          links = [buildLinkFromParams({
+            uuid: $('paramUUID').value.trim(),
+            host: $('paramHost').value.trim(),
+            path: $('paramPath').value.trim() || '/',
+            name: $('paramName').value.trim(),
+            security: $('paramSec').value,
+            type: $('paramType').value,
+            fp: $('paramFP').value
+          })];
+        } catch (e) {
+          showError(e.message);
+          return;
+        }
+      }
+      var addresses = parseAddresses($('inputAddresses').value);
+      var ports = getSelectedPorts();
+
+      if (!links.length) { showError('请提供至少一个原始节点'); return; }
+      if (!addresses.length) { showError('请填写至少一个优选地址'); return; }
+      if (!ports.length) { showError('请至少选择一个端口'); return; }
+
       try {
-        var r = generate(link, addrs, ports);
+        var r = generateAll(links, addresses, ports);
         if (!r.count) { showError('未生成任何节点，请检查输入'); return; }
         $('outputBase64').value = r.base64;
         $('outputPlain').value = r.plainText;
         $('count').textContent = r.count;
         if (!$('showPlain').checked) $('plainSection').style.display = 'none';
-        showToast('✅ 成功生成 ' + r.count + ' 个节点');
-        var url = buildSubscriptionUrl();
-        if (url) {
-          _subUrl = url;
-          $('subUrlDisplay').value = url;
-          $('urlLen').textContent = url.length;
-          $('subUrlSection').style.display = 'block';
-        }
-      } catch (e) { showError('❌ ' + e.message); }
-    }
 
-    function handleTogglePlain() {
-      $('plainSection').style.display = $('showPlain').checked ? 'block' : 'none';
+        // 显示节点列表
+        var nl = $('nodeList');
+        nl.innerHTML = '';
+        for (var i = 0; i < r.items.length; i++) {
+          var it = r.items[i];
+          var div = document.createElement('div');
+          div.className = 'node-list-item';
+          var idxSpan = document.createElement('span');
+          idxSpan.className = 'idx';
+          idxSpan.textContent = '#' + (i + 1);
+          var nmSpan = document.createElement('span');
+          nmSpan.className = 'nm';
+          // Extract name from vless link (after #)
+          var hashIdx2 = it.plain.lastIndexOf('#');
+          var nm2 = hashIdx2 >= 0 ? it.plain.slice(hashIdx2 + 1) : '';
+          nmSpan.textContent = nm2 || it.plain.slice(0, 60);
+          div.appendChild(idxSpan);
+          div.appendChild(nmSpan);
+          nl.appendChild(div);
+        }
+        $('nodeListSection').style.display = 'block';
+
+        showToast('✅ 成功生成 ' + r.count + ' 个节点');
+      } catch (e) {
+        showError('❌ ' + e.message);
+      }
     }
 
     // ── 复制 / 下载 / 清空 ──
@@ -630,11 +686,7 @@ if (typeof window !== 'undefined') {
     function handleCopy() {
       var t = $('outputBase64').value;
       if (!t) { showToast('没有可复制的内容'); return; }
-      copyToClipboard(t, '📋 已复制 base64 订阅链接');
-    }
-    function handleCopySubUrl() {
-      if (!_subUrl) { showToast('请先生成节点'); return; }
-      copyToClipboard(_subUrl, '🔗 已复制订阅地址');
+      copyToClipboard(t, '📋 已复制 base64 数据');
     }
     function handleCopyPlain() {
       var t = $('outputPlain').value;
@@ -656,41 +708,43 @@ if (typeof window !== 'undefined') {
       showToast('💾 文件已下载');
     }
     function handleClear() {
-      $('inputLink').value = '';
-      $('inputAddresses').value = '';
-      $('inputPorts').value = '';
+      if (currentMode === 'paste') $('inputLinks').value = '';
+      $('paramUUID').value = '';
+      $('paramHost').value = '';
+      $('paramName').value = '';
+      $('paramPath').value = '/';
       $('outputBase64').value = '';
       $('outputPlain').value = '';
       $('count').textContent = '0';
       $('showPlain').checked = false;
       $('plainSection').style.display = 'none';
-      $('subUrlSection').style.display = 'none';
-      _subUrl = '';
+      $('nodeListSection').style.display = 'none';
       showError('');
       showToast('🗑️ 已清空');
     }
 
-    // ── 构建订阅地址 URL（指向 index.html 自身，~ 分隔符不编码，缩短 URL）──
-    function buildSubscriptionUrl() {
-      var link = $('inputLink').value.trim();
-      if (!link) return '';
-      var addrs = $('inputAddresses').value.trim();
-      var ports = $('inputPorts').value.trim();
-      if (!addrs || !ports) return '';
-      var p = extractParams(link);
-      var parts = [];
-      var add = function (k, v) { if (v) parts.push(k + '=' + encodeURIComponent(v)); };
-      add('u', p.u);
-      add('s', p.s || p.h);
-      if (p.h && p.h !== p.s) add('h', p.h);
-      if (p.p && p.p !== '/') add('p', p.p);
-      if (p.f && p.f !== 'chrome') add('f', p.f);
-      if (p.n) add('n', p.n);
-      if (p.sec && p.sec !== 'tls') add('sec', p.sec);
-      if (p.ty && p.ty !== 'ws') add('ty', p.ty);
-      add('i', addrs.replace(/[,\s]+/g, '~'));
-      add('t', ports.replace(/[,\s]+/g, '~'));
-      return window.location.origin + '/sub?' + parts.join('&');
+    function handleTogglePlain() {
+      $('plainSection').style.display = $('showPlain').checked ? 'block' : 'none';
+    }
+
+    // ── 模式切换 ──
+    function handleModeSwitch(mode) {
+      currentMode = mode;
+      var opts = document.querySelectorAll('.mode-option');
+      for (var i = 0; i < opts.length; i++) {
+        opts[i].classList.toggle('active', opts[i].getAttribute('data-mode') === mode);
+      }
+      $('pasteMode').classList.toggle('active', mode === 'paste');
+      $('paramsMode').classList.toggle('active', mode === 'params');
+    }
+
+    // ── 端口复选框样式 ──
+    function updatePortStyles() {
+      var checks = document.querySelectorAll('.port-check');
+      for (var i = 0; i < checks.length; i++) {
+        var input = checks[i].querySelector('input');
+        checks[i].classList.toggle('checked', input.checked);
+      }
     }
 
     // ── 构建界面并绑定事件 ──
@@ -700,24 +754,38 @@ if (typeof window !== 'undefined') {
       document.head.appendChild(style);
       document.body.innerHTML = UI_HTML;
 
+      // 预填默认地址
+      loadDefaultAddresses();
+
+      // 模式切换
+      var modeOpts = document.querySelectorAll('.mode-option');
+      for (var i = 0; i < modeOpts.length; i++) {
+        (function (opt) {
+          opt.addEventListener('click', function () {
+            handleModeSwitch(opt.getAttribute('data-mode'));
+          });
+        })(modeOpts[i]);
+      }
+
+      // 端口复选框
+      var portInputs = document.querySelectorAll('#portChecks input[type=checkbox]');
+      for (var j = 0; j < portInputs.length; j++) {
+        portInputs[j].addEventListener('change', updatePortStyles);
+      }
+      updatePortStyles();
+
+      // 按钮
       $('generateBtn').addEventListener('click', handleGenerate);
       $('showPlain').addEventListener('change', handleTogglePlain);
       $('copyBtn').addEventListener('click', handleCopy);
-      $('copySubBtn').addEventListener('click', handleCopySubUrl);
       $('copyPlainBtn').addEventListener('click', handleCopyPlain);
       $('downloadBtn').addEventListener('click', handleDownload);
       $('clearBtn').addEventListener('click', handleClear);
+
+      // Ctrl+Enter 快捷生成
       document.addEventListener('keydown', function (e) {
         if (e.ctrlKey && e.key === 'Enter') { e.preventDefault(); handleGenerate(); }
       });
-
-      // 预填 URL 参数（部分参数时进入正常模式并回填输入框）
-      var p = readUrlParams();
-      if (p) {
-        if (p.link) $('inputLink').value = p.link;
-        if (p.addresses) $('inputAddresses').value = p.addresses;
-        if (p.ports) $('inputPorts').value = p.ports;
-      }
     }
 
     if (document.readyState === 'loading') {
